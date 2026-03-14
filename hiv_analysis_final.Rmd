@@ -1,0 +1,720 @@
+---
+title: "CHL5222 Final Project"
+subtitle: "Breastfeeding and HIV Exposure on Infant Growth"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+---
+
+# Background
+
+**Main outcome:** Weight-for-length z-score (`zwfl`)
+
+HIV-exposed uninfected (CHEU) infants are children born to mothers living with HIV
+who did not acquire the virus themselves, while HIV-unexposed (CHU) infants are born
+to HIV-negative mothers. We compare growth trajectories between these groups and
+assess whether breastfeeding modifies the relationship.
+
+**Research objective:** To compare the growth trajectory of CHEU and CHU infants
+over 0--24 months, and to assess whether breastfeeding modifies this relationship.
+
+---
+
+# Libraries
+
+```{r libraries}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(splines)
+library(emmeans)
+library(ggeffects)
+library(broom.mixed)
+library(patchwork)
+library(janitor)
+library(naniar)
+library(knitr)
+library(kableExtra)
+```
+
+---
+
+# Data Import
+
+```{r import}
+dat <- read.csv("hiv.csv", stringsAsFactors = FALSE) |>
+  clean_names()
+```
+
+---
+
+# Variable Descriptions
+
+The dataset contains repeated growth measurements of infants followed from birth
+to 24 months.
+
+| Variable | Description |
+|---|---|
+| `newid` | Unique infant identifier |
+| `visit` | Study visit |
+| `infage_month` | Infant age (months) -- time dimension |
+| `zwfl` | Weight-for-length Z-score (primary outcome) |
+| `enrol_hiv_status_cat` | Maternal HIV status -- defines CHEU vs CHU |
+| `ebf_updated` | Exclusive breastfeeding status |
+| `bf_current_1year` | Breastfeeding status at 1 year |
+| `b1_sex` | Infant sex |
+| `gestage_final` | Gestational age at birth (weeks) |
+| `momage_cat` | Maternal age category |
+| `educ_cat_n` | Maternal education level |
+
+---
+
+# Inspect Data
+
+```{r inspect}
+str(dat)
+summary(dat)
+colSums(is.na(dat))
+```
+
+---
+
+# Recode Variables
+
+```{r recode}
+analysis_dat <- dat |>
+  mutate(
+    newid = factor(newid),
+
+    # HIV exposure group:
+    # "Positive" maternal status = infant HIV-exposed uninfected (CHEU)
+    # "Negative" maternal status = HIV-unexposed (CHU)
+    hiv_group = case_when(
+      enrol_hiv_status_cat == "Positive" ~ "CHEU",
+      enrol_hiv_status_cat == "Negative" ~ "CHU",
+      TRUE ~ NA_character_
+    ),
+    hiv_group = factor(hiv_group, levels = c("CHU", "CHEU")),
+
+    # Order visits chronologically for plotting
+    visit = factor(visit, levels = c(
+      "delivery",
+      "week-3",
+      "week-6",
+      "month-3",
+      "month-6",
+      "month-9",
+      "month-12",
+      "month-18",
+      "month-24"
+    )),
+
+    # Infant sex
+    sex = factor(b1_sex),
+
+    # Maternal characteristics
+    momage_cat = factor(momage_cat),
+    educ_cat_n = factor(educ_cat_n),
+
+    # Breastfeeding -- exclusive (ebf_updated)
+    ebf_updated = case_when(
+      tolower(ebf_updated) %in% c("yes", "y") ~ "Yes",
+      tolower(ebf_updated) %in% c("no", "n")  ~ "No",
+      TRUE ~ NA_character_
+    ),
+    ebf_updated = factor(ebf_updated, levels = c("No", "Yes")),
+
+    # Breastfeeding -- current at 1 year (bf_current_1year)
+    bf_current_1year = case_when(
+      tolower(bf_current_1year) %in% c("yes", "y") ~ "Yes",
+      tolower(bf_current_1year) %in% c("no", "n")  ~ "No",
+      TRUE ~ NA_character_
+    ),
+    bf_current_1year = factor(bf_current_1year, levels = c("No", "Yes")),
+
+    # Continuous variables
+    infage_month  = as.numeric(infage_month),
+    gestage_final = as.numeric(gestage_final),
+    zwfl          = as.numeric(zwfl),
+
+    # Mean-centred age: improves optimizer convergence and makes the intercept
+    # interpretable as expected outcome at the mean observed age (~13 months).
+    # Centred age: t* = t - mean(t)
+    infage_month_c = infage_month - mean(infage_month, na.rm = TRUE)
+  )
+```
+
+---
+
+# Basic Checks
+
+```{r checks}
+# Number of infants and total observations
+analysis_dat |>
+  summarise(
+    n_obs     = n(),
+    n_infants = n_distinct(newid)
+  )
+
+# Outcome missingness
+analysis_dat |>
+  summarise(
+    missing_zwfl = sum(is.na(zwfl))
+  )
+
+# Group counts
+table(analysis_dat$hiv_group,        useNA = "ifany")
+table(analysis_dat$ebf_updated,      useNA = "ifany")
+table(analysis_dat$bf_current_1year, useNA = "ifany")
+```
+
+---
+
+# Descriptive Statistics
+```{r desc-helpers, echo=FALSE}
+# ── Helper functions for descriptive tables ──────────────────────────────────
+
+# Mean (SD) formatted string
+fmt_mean_sd <- function(x) {
+  x <- x[!is.na(x)]
+  sprintf("%.1f (%.1f)", mean(x), sd(x))
+}
+
+# n (%) formatted string
+fmt_n_pct <- function(x, level) {
+  n_total <- sum(!is.na(x))
+  n_level <- sum(x == level, na.rm = TRUE)
+  sprintf("%d (%.1f%%)", n_level, 100 * n_level / n_total)
+}
+
+# Significance stars
+pstar <- function(p) {
+  dplyr::case_when(
+    is.na(p)   ~ "",
+    p < 0.001  ~ "***",
+    p < 0.01   ~ "**",
+    p < 0.05   ~ "*",
+    TRUE       ~ ""
+  )
+}
+
+# Format p-value with stars
+fmt_p <- function(p) {
+  dplyr::case_when(
+    is.na(p)   ~ "",
+    p < 0.001  ~ paste0("<0.001", pstar(p)),
+    TRUE       ~ paste0(sprintf("%.3f", p), pstar(p))
+  )
+}
+```
+
+## Table 1 -- Infant and Maternal Characteristics at Baseline
+
+Baseline is defined as the earliest observation per infant (delivery visit).
+Continuous variables: mean (SD); categorical: n (%).
+Significance codes: \*p<0.05, \*\*p<0.01, \*\*\*p<0.001.
+
+```{r table1}
+# One row per infant -- baseline visit only
+baseline_dat <- analysis_dat |>
+  group_by(newid) |>
+  slice_min(infage_month, with_ties = FALSE) |>
+  ungroup()
+
+chu  <- baseline_dat |> filter(hiv_group == "CHU")
+cheu <- baseline_dat |> filter(hiv_group == "CHEU")
+n_chu  <- nrow(chu)
+n_cheu <- nrow(cheu)
+
+# Build rows manually for full label control
+tbl1 <- tribble(
+  ~Characteristic,                         ~CHU,                                     ~CHEU,
+  # --- Infant sex ---
+  "Infant sex, n (%)",                       "",                                       "",
+  "  Female",
+    fmt_n_pct(chu$b1_sex,  "female"),
+    fmt_n_pct(cheu$b1_sex, "female"),
+  "  Male",
+    fmt_n_pct(chu$b1_sex,  "male"),
+    fmt_n_pct(cheu$b1_sex, "male"),
+  # --- Gestational age ---
+  "Gestational age (weeks), mean (SD)",
+    fmt_mean_sd(chu$gestage_final),
+    fmt_mean_sd(cheu$gestage_final),
+  # --- Maternal age ---
+  "Maternal age category, n (%)",            "",                                       "",
+  "  25 years and under",
+    fmt_n_pct(chu$momage_cat,  "25 and less"),
+    fmt_n_pct(cheu$momage_cat, "25 and less"),
+  "  26 to 35 years",
+    fmt_n_pct(chu$momage_cat,  "26 to 35"),
+    fmt_n_pct(cheu$momage_cat, "26 to 35"),
+  "  Over 35 years",
+    fmt_n_pct(chu$momage_cat,  "35 and more"),
+    fmt_n_pct(cheu$momage_cat, "35 and more"),
+  # --- Education ---
+  "Maternal education, n (%)",               "",                                       "",
+  "  Primary or below",
+    fmt_n_pct(chu$educ_cat_n,  "Primary or below"),
+    fmt_n_pct(cheu$educ_cat_n, "Primary or below"),
+  "  Secondary and above",
+    fmt_n_pct(chu$educ_cat_n,  "Secondary and above"),
+    fmt_n_pct(cheu$educ_cat_n, "Secondary and above"),
+  # --- Breastfeeding ---
+  "Exclusively breastfed -- Yes, n (%)",
+    fmt_n_pct(chu$ebf_updated[!is.na(chu$ebf_updated)],   "Yes"),
+    fmt_n_pct(cheu$ebf_updated[!is.na(cheu$ebf_updated)], "Yes"),
+  "Breastfeeding at 1 year -- Yes, n (%)",
+    fmt_n_pct(chu$bf_current_1year[!is.na(chu$bf_current_1year)],   "Yes"),
+    fmt_n_pct(cheu$bf_current_1year[!is.na(cheu$bf_current_1year)], "Yes")
+)
+
+# Compute p-values for rows that need them
+p_sex    <- chisq.test(table(baseline_dat$b1_sex,        baseline_dat$hiv_group))$p.value
+p_gest   <- t.test(gestage_final ~ hiv_group, data = baseline_dat)$p.value
+p_momage <- chisq.test(table(baseline_dat$momage_cat,    baseline_dat$hiv_group))$p.value
+p_educ   <- chisq.test(table(baseline_dat$educ_cat_n,    baseline_dat$hiv_group))$p.value
+p_ebf    <- chisq.test(table(
+  baseline_dat$ebf_updated[!is.na(baseline_dat$ebf_updated)],
+  baseline_dat$hiv_group[ !is.na(baseline_dat$ebf_updated)]
+))$p.value
+p_bf1yr  <- chisq.test(table(
+  baseline_dat$bf_current_1year[!is.na(baseline_dat$bf_current_1year)],
+  baseline_dat$hiv_group[       !is.na(baseline_dat$bf_current_1year)]
+))$p.value
+
+# Assign p-values to header rows; subrows left blank
+tbl1$`p-value` <- c(
+  fmt_p(p_sex),    "", "",          # sex header + 2 rows
+  fmt_p(p_gest),                    # gestational age
+  fmt_p(p_momage), "", "", "",      # maternal age header + 3 rows
+  fmt_p(p_educ),   "", "",          # education header + 2 rows
+  fmt_p(p_ebf),                     # exclusive BF
+  fmt_p(p_bf1yr)                    # BF at 1 year
+)
+
+kable(
+  tbl1,
+  col.names = c(
+    "Characteristic",
+    paste0("CHU (n = ", n_chu, ")"),
+    paste0("CHEU (n = ", n_cheu, ")"),
+    "p-value"
+  ),
+  caption  = paste0(
+    "Table 1. Baseline infant and maternal characteristics by HIV exposure group.",
+    "Significance: *p<0.05, **p<0.01, ***p<0.001."
+  ),
+  booktabs = TRUE,
+  align    = "lllr"
+) |>
+  kable_styling(
+    latex_options = c("hold_position", "scale_down"),
+    font_size     = 10
+  ) |>
+  row_spec(0, bold = TRUE) |>
+  row_spec(c(1, 5, 9, 12), bold = TRUE) |>   # bold category headers
+  footnote(
+    general = paste0(
+      "p-values: two-sample t-test for gestational age; ",
+      "chi-squared test for all categorical variables."
+    ),
+    general_title     = "Note:",
+    footnote_as_chunk = TRUE
+  )
+```
+
+---
+
+## Table 2 -- Summary of Growth Outcomes by HIV Group and Visit
+
+Mean (SD) of `zwfl` at each study visit by HIV exposure group.
+Between-group differences tested with two-sample t-tests at each visit.
+Significance codes: \*p<0.05, \*\*p<0.01, \*\*\*p<0.001.
+
+```{r table2}
+# Compute means and SDs per group per visit
+growth_tbl <- analysis_dat |>
+  filter(!is.na(zwfl), !is.na(hiv_group)) |>
+  group_by(visit, hiv_group) |>
+  summarise(
+    n        = n(),
+    m_zwfl   = mean(zwfl, na.rm = TRUE),
+    sd_zwfl  = sd(zwfl,   na.rm = TRUE),
+    .groups  = "drop"
+  ) |>
+  mutate(
+    zwfl_fmt = sprintf("%.2f (%.2f)", m_zwfl, sd_zwfl)
+  )
+
+# t-test p-values per visit
+pvals_visit <- analysis_dat |>
+  filter(!is.na(zwfl), !is.na(hiv_group)) |>
+  group_by(visit) |>
+  summarise(
+    p_zwfl = tryCatch(t.test(zwfl ~ hiv_group)$p.value, error = function(e) NA_real_),
+    .groups = "drop"
+  ) |>
+  mutate(
+    p_zwfl_fmt = fmt_p(p_zwfl)
+  )
+
+# Pivot wide: one row per visit
+growth_wide <- growth_tbl |>
+  select(visit, hiv_group, n, zwfl_fmt) |>
+  pivot_wider(
+    names_from  = hiv_group,
+    values_from = c(n, zwfl_fmt)
+  ) |>
+  left_join(pvals_visit |> select(visit, p_zwfl_fmt),
+            by = "visit") |>
+  select(
+    visit,
+    n_CHU,  zwfl_fmt_CHU,
+    n_CHEU, zwfl_fmt_CHEU,
+    p_zwfl_fmt
+  )
+
+kable(
+  growth_wide,
+  col.names = c(
+    "Visit",
+    "N", "zwfl Mean (SD)",
+    "N", "zwfl Mean (SD)",
+    "p-value"
+  ),
+  caption  = paste0(
+    "Table 2. Mean (SD) of weight-for-length Z-score (zwfl) by HIV exposure group and study visit. ",
+    "Significance: *p<0.05, **p<0.01, ***p<0.001."
+  ),
+  booktabs = TRUE,
+  align    = "lrlrlc"
+) |>
+  kable_styling(
+    latex_options = c("hold_position", "scale_down"),
+    font_size     = 9
+  ) |>
+  add_header_above(c(
+    " "                = 1,
+    "CHU"              = 2,
+    "CHEU"             = 2,
+    "Group difference" = 1
+  )) |>
+  row_spec(0, bold = TRUE) |>
+  footnote(
+    general = paste0(
+      "zwfl = weight-for-length Z-score. ",
+      "p-values from two-sample t-test at each visit (unadjusted for multiple comparisons)."
+    ),
+    general_title     = "Note:",
+    footnote_as_chunk = TRUE
+  )
+```
+
+---
+
+# Exploratory Plots
+
+## Figure 1 -- Individual Growth Trajectories and Mean Profiles (zwfl)
+
+```{r fig1, fig.height=7, fig.width=7}
+# Panel A: spaghetti plot with LOESS smoothed group means
+p1 <- analysis_dat |>
+  filter(!is.na(zwfl), !is.na(hiv_group)) |>
+  ggplot(aes(x = infage_month, y = zwfl, group = newid, color = hiv_group)) +
+  geom_line(alpha = 0.15) +
+  geom_smooth(aes(group = hiv_group), method = "loess", se = TRUE, linewidth = 1.2) +
+  labs(
+    title = "Individual and average growth trajectories",
+    x     = "Infant age (months)",
+    y     = "Weight-for-length z-score (zwfl)",
+    color = "Group"
+  ) +
+  theme_minimal()
+
+# Panel B: mean +/- 95% CI at each visit
+p2 <- analysis_dat |>
+  filter(!is.na(zwfl), !is.na(hiv_group)) |>
+  group_by(visit, hiv_group) |>
+  summarise(
+    mean_zwfl = mean(zwfl, na.rm = TRUE),
+    se_zwfl   = sd(zwfl, na.rm = TRUE) / sqrt(sum(!is.na(zwfl))),
+    .groups   = "drop"
+  ) |>
+  ggplot(aes(x = visit, y = mean_zwfl, group = hiv_group, color = hiv_group)) +
+  geom_line() +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_zwfl - 1.96 * se_zwfl,
+                    ymax = mean_zwfl + 1.96 * se_zwfl),
+                width = 0.2) +
+  labs(
+    title = "Mean zwfl by visit",
+    x     = "Visit",
+    y     = "Mean zwfl",
+    color = "Group"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p1 / p2
+```
+
+## Figure 2 -- Growth Trajectories Stratified by Breastfeeding Status
+
+Mean zwfl +/- 95% CI at each visit, jointly stratified by HIV group and
+breastfeeding status at 1 year. Motivates the interaction structure in
+the statistical model.
+
+```{r fig2, fig.height=5, fig.width=8}
+analysis_dat |>
+  filter(!is.na(zwfl), !is.na(hiv_group), !is.na(bf_current_1year)) |>
+  group_by(visit, hiv_group, bf_current_1year) |>
+  summarise(
+    mean_zwfl = mean(zwfl, na.rm = TRUE),
+    se_zwfl   = sd(zwfl, na.rm = TRUE) / sqrt(sum(!is.na(zwfl))),
+    .groups   = "drop"
+  ) |>
+  ggplot(aes(
+    x        = visit,
+    y        = mean_zwfl,
+    group    = interaction(hiv_group, bf_current_1year),
+    colour   = hiv_group,
+    linetype = bf_current_1year
+  )) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  geom_errorbar(
+    aes(ymin = mean_zwfl - 1.96 * se_zwfl,
+        ymax = mean_zwfl + 1.96 * se_zwfl),
+    width = 0.2, linewidth = 0.5
+  ) +
+  scale_linetype_manual(
+    values = c("No" = "dashed", "Yes" = "solid"),
+    labels = c("No" = "Not breastfed at 1 year",
+               "Yes" = "Breastfed at 1 year")
+  ) +
+  labs(
+    title    = "Mean zwfl by HIV group and breastfeeding status",
+    x        = "Visit",
+    y        = "Mean zwfl",
+    colour   = "HIV Group",
+    linetype = "Breastfeeding at 1 year"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+```
+
+## Missingness
+
+```{r missingness}
+vis_miss(analysis_dat)
+```
+
+---
+
+# Analytic Dataset
+
+```{r main-dataset}
+# Complete cases for all primary model variables.
+# Excludes: 37 missing zwfl, 22 missing bf_current_1year, 5 missing ebf_updated.
+main_dat <- analysis_dat |>
+  filter(
+    !is.na(zwfl),
+    !is.na(hiv_group),
+    !is.na(infage_month),
+    !is.na(bf_current_1year),
+    !is.na(ebf_updated),
+    !is.na(sex)
+  )
+```
+
+---
+
+# Statistical Model
+
+## Model Specification
+
+We fit a **linear mixed effects model** (LME) to account for the correlation
+of repeated measures within each infant. The general model is:
+
+$$Y_{ij} = \beta_0 + \beta_1 H_i + \beta_2 B_i + \beta_3 t^*_{ij} + \beta_4 S_i
+           + \text{interactions} + u_i + \varepsilon_{ij}$$
+
+where:
+
+- $Y_{ij}$ = zwfl for infant $i$ at time $j$  
+- $H_i$ = HIV group (0 = CHU, 1 = CHEU)  
+- $B_i$ = breastfeeding status (0 = No, 1 = Yes)  
+- $t^*_{ij}$ = mean-centred age in months: $t^* = t - \bar{t}$  
+- $S_i$ = infant sex (0 = Female, 1 = Male)  
+- $u_i \sim \mathcal{N}(0, \sigma^2_u)$ = random intercept per infant  
+- $\varepsilon_{ij} \sim \mathcal{N}(0, \sigma^2)$ = residual error  
+
+Mean-centring age improves optimizer convergence and makes $\beta_0$
+interpretable as expected zwfl at the **mean observed age** rather than at birth.
+
+## Stage 1 -- Random Effects Structure Selection (REML = TRUE)
+
+We use **AIC** with `REML = TRUE` (required for comparing random effects
+structures) to choose between:
+
+$$\text{Random intercept only: } \quad u_i \sim \mathcal{N}(0,\, \sigma^2_u)$$
+
+$$\text{Random intercept + slope: } \quad \begin{pmatrix} u_i \\ v_i \end{pmatrix} \sim \mathcal{N}\!\left(\mathbf{0},\, \boldsymbol{\Sigma}\right), \quad \boldsymbol{\Sigma} = \begin{pmatrix} \sigma^2_u & \rho\sigma_u\sigma_v \\ \rho\sigma_u\sigma_v & \sigma^2_v \end{pmatrix}$$
+
+```{r random-effects-selection}
+# first check if we need to add random slope
+model1_zwfl <- lmer(
+  zwfl ~ hiv_group * infage_month +
+         bf_current_1year * infage_month + 
+         hiv_group * bf_current_1year + 
+         sex + (1 | newid),
+  data = main_dat,
+  REML = TRUE   # REML = TRUE required for random effects comparison
+)
+
+model1_zwfl_slope <- lmer(
+  zwfl ~ hiv_group * infage_month +
+         bf_current_1year * infage_month + 
+         hiv_group * bf_current_1year + 
+         sex + (1 + infage_month | newid),
+  data = main_dat,
+  REML = TRUE   # REML = TRUE required for random effects comparison
+)
+
+summary(model1_zwfl)
+summary(model1_zwfl_slope)
+
+# AIC comparison -- lower AIC = preferred random effects structure
+AIC(model1_zwfl, model1_zwfl_slope)
+```
+
+## Stage 2 -- Fixed Effects Model Comparison (REML = FALSE)
+
+Using the random effects structure selected above, we compare two
+pre-specified models with **REML = FALSE** for valid likelihood ratio testing.
+
+**Model 1** (two-way interactions):
+$$Y_{ij} = \beta_0 + \beta_1 H_i + \beta_2 B_i + \beta_3 t^*_{ij} + \beta_4 S_i
+           + \beta_5(H_i \cdot t^*_{ij})
+           + \beta_6(B_i \cdot t^*_{ij})
+           + \beta_7(H_i \cdot B_i)
+           + u_i + \varepsilon_{ij}$$
+
+**Model 2** (three-way interaction -- research question):
+$$Y_{ij} = \beta_0 + \cdots + \beta_7(H_i \cdot B_i)
+           + \underbrace{\beta_8(H_i \cdot B_i \cdot t^*_{ij})}_{\text{key term: }H_0:\,\beta_8 = 0}
+           + u_i + \varepsilon_{ij}$$
+
+$\beta_8$ tests whether breastfeeding **differentially** modifies the CHEU vs CHU
+growth trajectory over time -- the direct answer to the research objective.
+
+```{r models}
+# Update random structure below based on Stage 1 AIC result:
+#   Random intercept only  --> (1 | newid)
+#   Random slope included  --> (1 + infage_month | newid)
+
+# Model 1: all two-way interactions (REML = FALSE for fixed effects comparison)
+model1_zwfl <- lmer(
+  zwfl ~ hiv_group * infage_month +
+         bf_current_1year * infage_month + 
+         hiv_group * bf_current_1year + 
+         sex + (1 + infage_month | newid),
+  data = main_dat,
+  REML = FALSE
+)
+
+# Model 2: three-way interaction -- directly tests the research question
+# H0: beta_8 = 0 (breastfeeding does NOT differentially modify HIV-growth trajectory)
+# H1: beta_8 != 0 (breastfeeding DOES modify the HIV-growth trajectory)
+model2_zwfl <- lmer(
+  zwfl ~ hiv_group * bf_current_1year * infage_month +
+         sex + (1 + infage_month | newid),
+  data = main_dat,
+  REML = FALSE
+)
+
+summary(model1_zwfl)
+anova(model1_zwfl)
+
+summary(model2_zwfl)
+anova(model2_zwfl)
+```
+
+```{r model-comparison}
+# Likelihood ratio test: Model 1 vs Model 2
+# 1 degree of freedom (adds only beta_8)
+# p < 0.05 --> report Model 2 (BF modifies HIV-growth trajectory)
+# p >= 0.05 --> report Model 1 (no differential modification by BF)
+anova(model1_zwfl, model2_zwfl)
+```
+
+## Final Model Parameter Estimates
+
+```{r results-table}
+# Refit chosen (final) model with REML = TRUE for unbiased parameter estimates
+# Update model formula below based on model comparison result above
+
+tidy(model1_zwfl,
+     effects  = "fixed",
+     conf.int = TRUE) |>
+  mutate(
+    term = dplyr::recode(term,
+      "(Intercept)"                          = "Intercept",
+      "hiv_groupCHEU"                        = "HIV group: CHEU vs CHU",
+      "infage_month"                         = "Age (months)",
+      "bf_current_1yearYes"                  = "Breastfeeding: Yes vs No",
+      "sexmale"                              = "Sex: Male vs Female",
+      "hiv_groupCHEU:infage_month"           = "CHEU x Age",
+      "infage_month:bf_current_1yearYes"     = "Breastfeeding x Age",
+      "hiv_groupCHEU:bf_current_1yearYes"    = "CHEU x Breastfeeding"
+    ),
+    across(c(estimate, std.error, conf.low, conf.high), ~round(.x, 3)),
+    sig     = pstar(p.value),
+    p.value = case_when(
+      p.value < 0.001 ~ paste0("<0.001", sig),
+      TRUE            ~ paste0(sprintf("%.3f", p.value), sig)
+    )
+  ) |>
+  select(term, estimate, std.error, conf.low, conf.high, p.value) |>
+  kable(
+    col.names = c("Term", "Estimate", "SE",
+                  "95% CI Lower", "95% CI Upper", "p-value"),
+    caption   = paste0(
+      "Table 3. Fixed effects estimates from final linear mixed effects model. ",
+      "Primary outcome: weight-for-length Z-score (zwfl). ",
+      "Significance: *p<0.05, **p<0.01, ***p<0.001."
+    ),
+    booktabs  = TRUE,
+    align     = "lrrrrr"
+  ) |>
+  kable_styling(
+    latex_options = "hold_position",
+    font_size     = 12
+  ) |>
+  row_spec(0, bold = TRUE) |>
+  footnote(
+    general = paste0(
+      "Estimates are change in zwfl per unit increase in the predictor. ",
+      "Reference group: CHU, not breastfed, female, at mean age. ",
+      "Model fitted with REML = TRUE."
+    ),
+    general_title     = "Note:",
+    footnote_as_chunk = TRUE
+  )
+```
