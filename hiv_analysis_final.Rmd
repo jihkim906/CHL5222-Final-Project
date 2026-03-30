@@ -430,45 +430,94 @@ kable(
 ## Figure 1 -- Individual Growth Trajectories and Mean Profiles (zwfl)
 
 ```{r fig1, fig.height=7, fig.width=7}
-# Panel A: spaghetti plot with LOESS smoothed group means
-p1 <- analysis_dat |>
-  filter(!is.na(zwfl), !is.na(hiv_group)) |>
-  ggplot(aes(x = infage_month, y = zwfl, group = newid, color = hiv_group)) +
-  geom_line(alpha = 0.15) +
-  geom_smooth(aes(group = hiv_group), method = "loess", se = TRUE, linewidth = 1.2) +
-  labs(
-    title = "Individual and average growth trajectories",
-    x     = "Infant age (months)",
-    y     = "Weight-for-length z-score (zwfl)",
-    color = "Group"
-  ) +
-  theme_minimal()
+library(ggplot2)
+library(dplyr)
+library(patchwork)
 
-# Panel B: mean +/- 95% CI at each visit
-p2 <- analysis_dat |>
+# ── shared theme ──────────────────────────────────────────────────────────────
+theme_report <- function() {
+  theme_classic(base_size = 11) +
+    theme(
+      plot.title       = element_blank(),
+      legend.position  = "bottom",
+      legend.title     = element_text(face = "bold", size = 10),
+      legend.text      = element_text(size = 10),
+      axis.title       = element_text(size = 11),
+      axis.text        = element_text(size = 10),
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+      panel.grid.minor = element_blank()
+    )
+}
+
+hiv_colors <- c("CHU" = "#2166AC", "CHEU" = "#D6604D")
+
+# ── Panel A: spaghetti + LOESS ────────────────────────────────────────────────
+fig1a <- analysis_dat |>
   filter(!is.na(zwfl), !is.na(hiv_group)) |>
+  ggplot(aes(x = infage_month, y = zwfl,
+             group = newid, color = hiv_group)) +
+  geom_line(alpha = 0.12, linewidth = 0.3) +
+  geom_smooth(aes(group = hiv_group),
+              method = "loess", se = TRUE, linewidth = 1.2, span = 0.6) +
+  scale_color_manual(values = hiv_colors,
+                     labels = c("CHU"  = "HIV-unexposed (CHU)",
+                                "CHEU" = "HIV-exposed uninfected (CHEU)")) +
+  scale_x_continuous(
+    breaks = c(1.5, 3, 6, 9, 12, 18, 24),
+    labels = c("1.5", "3", "6", "9", "12", "18", "24")
+  ) +
+  labs(
+    x     = "Infant age (months)",
+    y     = "Weight-for-length Z-score",
+    color = "HIV exposure group",
+    tag   = "A"
+  ) +
+  theme_report() 
+
+# ── Panel B: mean ± 95% CI at each visit ──────────────────────────────────────
+visit_levels <- c("delivery", "week-3", "week-6",
+                  "month-3",  "month-6", "month-9",
+                  "month-12", "month-18", "month-24")
+
+fig1b <- analysis_dat |>
+  filter(!is.na(zwfl), !is.na(hiv_group)) |>
+  mutate(visit = factor(visit, levels = visit_levels)) |>
   group_by(visit, hiv_group) |>
   summarise(
     mean_zwfl = mean(zwfl, na.rm = TRUE),
     se_zwfl   = sd(zwfl, na.rm = TRUE) / sqrt(sum(!is.na(zwfl))),
     .groups   = "drop"
   ) |>
-  ggplot(aes(x = visit, y = mean_zwfl, group = hiv_group, color = hiv_group)) +
-  geom_line() +
-  geom_point() +
+  ggplot(aes(x = visit, y = mean_zwfl,
+             group = hiv_group, color = hiv_group)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.2) +
   geom_errorbar(aes(ymin = mean_zwfl - 1.96 * se_zwfl,
                     ymax = mean_zwfl + 1.96 * se_zwfl),
-                width = 0.2) +
+                width = 0.25, linewidth = 0.6) +
+  scale_color_manual(values = hiv_colors,
+                     labels = c("CHU"  = "HIV-unexposed (CHU)",
+                                "CHEU" = "HIV-exposed uninfected (CHEU)")) +
   labs(
-    title = "Mean zwfl by visit",
-    x     = "Visit",
-    y     = "Mean zwfl",
-    color = "Group"
+    x     = "Study visit",
+    y     = "Mean weight-for-length Z-score",
+    color = "HIV exposure group",
+    tag   = "B"
   ) +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  theme_report() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
 
-p1 / p2
+# ── Combine side by side with single shared legend ────────────────────────────
+fig1_combined <- (fig1a | fig1b) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position  = "bottom",
+    legend.direction = "horizontal"
+  )
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+ggsave("fig1_combined.pdf", plot = fig1_combined,
+       width = 13, height = 5.5, units = "in", device = cairo_pdf)
 ```
 
 ## Figure 2 -- Growth Trajectories Stratified by Breastfeeding Status
@@ -478,12 +527,41 @@ breastfeeding status at 1 year. Motivates the interaction structure in
 the statistical model.
 
 ```{r fig2, fig.height=5, fig.width=8}
-analysis_dat |>
+library(ggplot2)
+library(dplyr)
+
+# ── shared theme ──────────────────────────────────────────────────────────────
+theme_report <- function() {
+  theme_classic(base_size = 11) +
+    theme(
+      plot.title       = element_blank(),
+      legend.position  = "bottom",
+      legend.title     = element_text(face = "bold", size = 9),
+      legend.text      = element_text(size = 9),
+      legend.key.width = unit(1.2, "cm"),       # ← wider key for dashed line
+      legend.spacing.y = unit(0.2, "cm"),
+      legend.box       = "vertical",            # ← stack the two legends
+      axis.title       = element_text(size = 10),
+      axis.text        = element_text(size = 9),
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+      panel.grid.minor = element_blank()
+    )
+}
+
+hiv_colors <- c("CHU" = "#2166AC", "CHEU" = "#D6604D")
+
+visit_levels <- c("delivery", "week-3", "week-6",
+                  "month-3",  "month-6", "month-9",
+                  "month-12", "month-18", "month-24")
+
+# ── Figure 2 ──────────────────────────────────────────────────────────────────
+fig2 <- analysis_dat |>
   filter(!is.na(zwfl), !is.na(hiv_group), !is.na(bf_current_1year)) |>
+  mutate(visit = factor(visit, levels = visit_levels)) |>
   group_by(visit, hiv_group, bf_current_1year) |>
   summarise(
     mean_zwfl = mean(zwfl, na.rm = TRUE),
-    se_zwfl   = sd(zwfl, na.rm = TRUE) / sqrt(sum(!is.na(zwfl))),
+    se_zwfl   = sd(zwfl,  na.rm = TRUE) / sqrt(sum(!is.na(zwfl))),
     .groups   = "drop"
   ) |>
   ggplot(aes(
@@ -493,30 +571,39 @@ analysis_dat |>
     colour   = hiv_group,
     linetype = bf_current_1year
   )) +
-  geom_line(linewidth = 0.9) +
+  geom_line(linewidth = 0.8) +
   geom_point(size = 1.8) +
   geom_errorbar(
     aes(ymin = mean_zwfl - 1.96 * se_zwfl,
         ymax = mean_zwfl + 1.96 * se_zwfl),
     width = 0.2, linewidth = 0.5
   ) +
+  scale_colour_manual(
+    values = hiv_colors,
+    labels = c("CHU"  = "HIV-unexposed (CHU)",
+               "CHEU" = "HIV-exposed uninfected (CHEU)")
+  ) +
   scale_linetype_manual(
     values = c("No" = "dashed", "Yes" = "solid"),
-    labels = c("No" = "Not breastfed at 1 year",
+    labels = c("No"  = "Not breastfed at 1 year",
                "Yes" = "Breastfed at 1 year")
   ) +
-  labs(
-    title    = "Mean zwfl by HIV group and breastfeeding status",
-    x        = "Visit",
-    y        = "Mean zwfl",
-    colour   = "HIV Group",
-    linetype = "Breastfeeding at 1 year"
+  guides(
+    colour   = guide_legend(order = 1, nrow = 1, title = "HIV exposure group"),
+    linetype = guide_legend(order = 2, nrow = 1, title = "Breastfeeding status at 1 year")
   ) +
-  theme_minimal() +
-  theme(
-    axis.text.x     = element_text(angle = 45, hjust = 1),
-    legend.position = "bottom"
-  )
+  labs(
+    x        = "Study visit",
+    y        = "Mean weight-for-length Z-score",
+    colour   = "HIV exposure group",
+    linetype = "Breastfeeding status at 1 year"
+  ) +
+  theme_report() 
+#  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+ggsave("fig2_bf_hiv.pdf", plot = fig2,
+       width = 6.5, height = 5.2, units = "in", device = cairo_pdf)
 ```
 
 ## Missingness
@@ -563,7 +650,7 @@ where:
 - $t^*_{ij}$ = mean-centred age in months: $t^* = t - \bar{t}$  
 - $S_i$ = infant sex (0 = Female, 1 = Male)  
 - $u_i \sim \mathcal{N}(0, \sigma^2_u)$ = random intercept per infant  
-- $\varepsilon_{ij} \sim \mathcal{N}(0, \sigma^2)$ = residual error  
+- $\varepsilon_{ij} \sim \mathcal{N}(0, \sigma^2)$ =s residual error  
 
 Mean-centring age improves optimizer convergence and makes $\beta_0$
 interpretable as expected zwfl at the **mean observed age** rather than at birth.
@@ -604,56 +691,41 @@ summary(model1_zwfl_slope)
 AIC(model1_zwfl, model1_zwfl_slope)
 ```
 
-## Stage 2 -- Fixed Effects Model Comparison (REML = FALSE)
-
-Using the random effects structure selected above, we compare two
-pre-specified models with **REML = FALSE** for valid likelihood ratio testing.
-
-**Model 1** (two-way interactions):
-$$Y_{ij} = \beta_0 + \beta_1 H_i + \beta_2 B_i + \beta_3 t^*_{ij} + \beta_4 S_i
-           + \beta_5(H_i \cdot t^*_{ij})
-           + \beta_6(B_i \cdot t^*_{ij})
-           + \beta_7(H_i \cdot B_i)
-           + u_i + \varepsilon_{ij}$$
-
-**Model 2** (three-way interaction -- research question):
-$$Y_{ij} = \beta_0 + \cdots + \beta_7(H_i \cdot B_i)
-           + \underbrace{\beta_8(H_i \cdot B_i \cdot t^*_{ij})}_{\text{key term: }H_0:\,\beta_8 = 0}
-           + u_i + \varepsilon_{ij}$$
-
-$\beta_8$ tests whether breastfeeding **differentially** modifies the CHEU vs CHU
-growth trajectory over time -- the direct answer to the research objective.
-
 ```{r models}
-# Update random structure below based on Stage 1 AIC result:
-#   Random intercept only  --> (1 | newid)
-#   Random slope included  --> (1 + infage_month | newid)
-
-# Model 1: all two-way interactions (REML = FALSE for fixed effects comparison)
+# Model 1
 model1_zwfl <- lmer(
-  zwfl ~ hiv_group * infage_month +
-         bf_current_1year * infage_month + 
-         hiv_group * bf_current_1year + 
-         sex + (1 + infage_month | newid),
+  zwfl ~ sex + hiv_group + infage_month_c + bf_current_1year + 
+    (1 + infage_month_c | newid),
   data = main_dat,
-  REML = FALSE
+  REML = TRUE
 )
 
-# Model 2: three-way interaction -- directly tests the research question
-# H0: beta_8 = 0 (breastfeeding does NOT differentially modify HIV-growth trajectory)
-# H1: beta_8 != 0 (breastfeeding DOES modify the HIV-growth trajectory)
+# Model 2
 model2_zwfl <- lmer(
-  zwfl ~ hiv_group * bf_current_1year * infage_month +
-         sex + (1 + infage_month | newid),
+  zwfl ~ hiv_group * infage_month_c + bf_current_1year +
+    sex + (1 + infage_month_c | newid),
   data = main_dat,
-  REML = FALSE
+  REML = TRUE
+)
+
+
+# Model 3
+model3_zwfl <- lmer(
+  zwfl ~ hiv_group * bf_current_1year * infage_month_c +
+         sex + (1 + infage_month_c | newid),
+  data = main_dat,
+  REML = TRUE
 )
 
 summary(model1_zwfl)
-anova(model1_zwfl)
-
 summary(model2_zwfl)
-anova(model2_zwfl)
+summary(model3_zwfl)
+
+
+anova(model1_zwfl, model2_zwfl)
+
+anova(model2_zwfl, model3_zwfl)
+
 ```
 
 ```{r model-comparison}
@@ -697,8 +769,7 @@ tidy(model1_zwfl,
                   "95% CI Lower", "95% CI Upper", "p-value"),
     caption   = paste0(
       "Table 3. Fixed effects estimates from final linear mixed effects model. ",
-      "Primary outcome: weight-for-length Z-score (zwfl). ",
-      "Significance: *p<0.05, **p<0.01, ***p<0.001."
+      "Primary outcome: weight-for-length Z-score (zwfl)."
     ),
     booktabs  = TRUE,
     align     = "lrrrrr"
@@ -711,8 +782,7 @@ tidy(model1_zwfl,
   footnote(
     general = paste0(
       "Estimates are change in zwfl per unit increase in the predictor. ",
-      "Reference group: CHU, not breastfed, female, at mean age. ",
-      "Model fitted with REML = TRUE."
+      "Reference group: CHU, not breastfed, female, at mean age. "
     ),
     general_title     = "Note:",
     footnote_as_chunk = TRUE
